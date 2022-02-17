@@ -5,9 +5,10 @@
 BOOST_AUTO_TEST_CASE(heap_test)
 {
 	securememory::win32::heap heap(1 << 30);
+	heap.allocate(1);
 }
 
-BOOST_AUTO_TEST_CASE(allocator_test)
+BOOST_AUTO_TEST_CASE(allocator_locked_test)
 {
 	securememory::win32::heap heap(1 << 20);
 	securememory::allocator< char > allocator(&heap);
@@ -47,7 +48,14 @@ BOOST_AUTO_TEST_CASE(vector_test)
 	BOOST_CHECK_THROW(vec.reserve(size * 200), std::bad_alloc);
 }
 
-namespace securememory { win32::heap* global_heap() { static win32::heap heap(1 << 20); return &heap; } }
+namespace securememory 
+{ 
+	win32::heap* global_heap() 
+	{
+		static win32::heap heap(1 << 20); 
+		return &heap; 
+	}
+}
 
 BOOST_AUTO_TEST_CASE(vector_test_global)
 {
@@ -63,4 +71,5 @@ BOOST_AUTO_TEST_CASE(map_test_global)
 	map.emplace(1, "aaa");
 
 	std::vector< std::string, securememory::allocator < std::string > > vec;
+	vec.emplace_back("bbb");
 }
