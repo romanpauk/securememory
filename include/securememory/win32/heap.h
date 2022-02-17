@@ -76,10 +76,9 @@ namespace securememory::win32
                     cleared += entry.cbData;
                 }
             }
-
-            // TODO:
-            // Everything what was allocated should be cleared
-            // assert(allocated_ - cleared == 0);
+                        
+            // Everything that was allocated should be cleared by now
+            assert(allocated_ - cleared == 0);
 
             // No need to unlock the pages as HeapDestroy will do it.
         }

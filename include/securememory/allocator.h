@@ -42,9 +42,9 @@ namespace securememory
             return ptr;
         }
 
-        void deallocate(value_type* p, std::size_t size) noexcept 
+        void deallocate(value_type* p, std::size_t n) noexcept 
         {
-            heap_->deallocate(p, size);
+            heap_->deallocate(p, n * sizeof(value_type));
         }
 
     private:
