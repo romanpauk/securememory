@@ -9,7 +9,7 @@ namespace securememory::win32
         class exception : public std::exception
         {
         public:
-            exception(const char* function, DWORD last_error)
+            exception(const char* function, DWORD last_error = GetLastError())
                 : last_error_(last_error)
                 , function_(function)
             {}
@@ -37,28 +37,34 @@ namespace securememory::win32
        
     public:
         heap(std::size_t reserve)
-            : heap_(HeapCreate(0, get_page_size(), reserve), heap_deleter())
-            , allocated_()
+            : allocated_()
         {            
-            // The code here needs to work with heap region that was created based on 'reserve' argument.
-            // But the region will most probably be bigger.
+            HANDLE handle = HeapCreate(0, get_page_size(), reserve);
+            if (!handle)
+            {
+                throw exception("HeapCreate");
+            }
 
-            std::tie(base_address_, size_) = get_heap_region(heap_.get(), reserve);
+            // The code with heap region that was created based on reserve argument.
+            // The region will most probably be bigger than what reserve requested.
+
+            std::tie(base_address_, size_) = get_heap_region(handle, reserve);
 
             // Resize the working set according to the region size.
             SIZE_T dwMin, dwMax;
             if (!GetProcessWorkingSetSize(GetCurrentProcess(), &dwMin, &dwMax))
             {
-                throw exception("GetProcessWorkingSetSize", GetLastError());
+                throw exception("GetProcessWorkingSetSize");
             }
 
             if (!SetProcessWorkingSetSize(GetCurrentProcess(), dwMin + size_ + 0, dwMax + size_ + 0))
             {
-                throw exception("SetProcessWorkingSetSize", GetLastError());
+                throw exception("SetProcessWorkingSetSize");
             }
 
             // Allocate reference count for each page in the region
             heap_page_refs_.resize(std::max(std::size_t(1), size_ / get_page_size()));
+            heap_.reset(handle);
         }
 
         ~heap()
