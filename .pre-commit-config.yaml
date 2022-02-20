@@ -18,6 +18,6 @@ repos:
     rev: 0.7.13
     hooks:
     -   id: mdformat
-        args: [--end-of-line=crlf, --number]
+        args: [--end-of-line=crlf, --number, --wrap=120]
         additional_dependencies:
         -   mdformat-gfm

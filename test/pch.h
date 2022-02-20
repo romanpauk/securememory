@@ -1,3 +1,10 @@
+//
+// This file is part of SecureMemory project <https://github.com/romanpauk/securememory>
+//
+// See LICENSE for license and copyright information
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//
+
 #pragma once
 
 #if defined(_WIN32)
@@ -6,4 +13,3 @@
 #endif
 
 #include <boost/mpl/list.hpp>
-#include <boost/lexical_cast.hpp>

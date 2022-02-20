@@ -1,4 +1,11 @@
-// https://howardhinnant.github.io/allocator_boilerplate.html
+//
+// This file is part of SecureMemory project <https://github.com/romanpauk/securememory>
+//
+// See LICENSE for license and copyright information
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//
+
+// std::allocator interface is based on https://howardhinnant.github.io/allocator_boilerplate.html
 
 #if defined(_WIN32)
 #include <securememory/win32/heap.h>
