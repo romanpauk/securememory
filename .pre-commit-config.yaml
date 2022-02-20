@@ -1,0 +1,23 @@
+repos:
+-   repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v2.3.0
+    hooks:
+    -   id: check-yaml
+    -   id: check-case-conflict
+    -   id: end-of-file-fixer
+    -   id: trailing-whitespace
+    -   id: mixed-line-ending
+
+-   repo: https://github.com/macisamuele/language-formatters-pre-commit-hooks
+    rev: v2.2.0
+    hooks:
+    -   id: pretty-format-yaml
+        args: [--autofix, --indent, '4']
+
+-   repo: https://github.com/executablebooks/mdformat
+    rev: 0.7.13
+    hooks:
+    -   id: mdformat
+        args: [--end-of-line=crlf, --number]
+        additional_dependencies:
+        -   mdformat-gfm

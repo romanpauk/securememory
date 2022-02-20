@@ -7,5 +7,3 @@
 
 #include <boost/mpl/list.hpp>
 #include <boost/lexical_cast.hpp>
-
-

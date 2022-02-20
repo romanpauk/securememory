@@ -34,11 +34,11 @@ namespace securememory::win32
 
             typedef HANDLE pointer;
         };
-       
+
     public:
         heap(std::size_t reserve)
             : allocated_()
-        {            
+        {
             HANDLE handle = HeapCreate(0, get_page_size(), reserve);
             if (!handle)
             {
@@ -70,7 +70,7 @@ namespace securememory::win32
         ~heap()
         {
             assert(heap_ != NULL);
-            
+
             // Clear remaining allocations before unlocking
             std::size_t cleared = 0;
             PROCESS_HEAP_ENTRY entry = { 0 };
@@ -82,7 +82,7 @@ namespace securememory::win32
                     cleared += entry.cbData;
                 }
             }
-                        
+
             // Everything that was allocated should be cleared by now
             assert(allocated_ - cleared == 0);
 
@@ -107,18 +107,18 @@ namespace securememory::win32
                 {
                     uintptr_t index = (address - base) / get_page_size();
                     if (heap_page_refs_[index] == 0)
-                    {                        
+                    {
                         if (VirtualLock(reinterpret_cast<LPVOID>(address), get_page_size()))
                         {
                             ++heap_page_refs_[index];
                         }
                         else
-                        {             
-                            // We failed to lock the page so we don't have a secure allocation, 
+                        {
+                            // We failed to lock the page so we don't have a secure allocation,
                             // that is for sure. Clean what we can and return nullptr.
-                            deallocate(lock, ptr, size);                            
+                            deallocate(lock, ptr, size);
                             return nullptr;
-                        }                       
+                        }
                     }
                 }
 
@@ -134,10 +134,10 @@ namespace securememory::win32
             {
                 std::lock_guard< std::mutex > lock(mutex_);
 
-                // HeapSize is usually larger than what allocate/deallocate request. 
-                // Lets assume clients are not writing secure data over requested size.           
+                // HeapSize is usually larger than what allocate/deallocate request.
+                // Lets assume clients are not writing secure data over requested size.
                 assert(HeapSize(heap_.get(), 0, ptr) >= size);
-                               
+
                 // Bigger size is what we will clear and unlock.
                 SecureZeroMemory(ptr, size);
                 deallocate(lock, ptr, size);
@@ -148,7 +148,7 @@ namespace securememory::win32
         {
             return reinterpret_cast< uintptr_t >(base_address_);
         }
-                
+
         std::size_t locked_size() const
         {
             std::lock_guard< std::mutex > lock(mutex_);
@@ -206,17 +206,17 @@ namespace securememory::win32
         {
             LPVOID base = NULL;
             std::size_t size = 0;
-            PROCESS_HEAP_ENTRY entry = { 0 };            
+            PROCESS_HEAP_ENTRY entry = { 0 };
             while (HeapWalk(handle, &entry) != FALSE)
             {
                 if ((entry.wFlags & PROCESS_HEAP_REGION) != 0)
-                {   
+                {
                     assert(entry.Region.dwUnCommittedSize + entry.Region.dwCommittedSize >= reserve);
                     size = entry.Region.dwUnCommittedSize + entry.Region.dwCommittedSize;
-                                        
+
                     assert(base == 0);
                     base = entry.lpData;
-                    
+
                     // Walk it till the end to get proper error code
                 }
             }
@@ -226,7 +226,7 @@ namespace securememory::win32
             auto error = GetLastError();
             if (error != ERROR_NO_MORE_ITEMS)
             {
-                
+
                 throw exception("HeapWalk", error);
             }
 
@@ -240,11 +240,11 @@ namespace securememory::win32
             static uintptr_t page_size = []() { SYSTEM_INFO si; GetSystemInfo(&si); return si.dwPageSize; }();
             return page_size;
         }
-        
+
         // TODO: this mutex is on very defensive side. It should be possible to use atomic refcounts at least.
         mutable std::mutex mutex_;
 
-        std::unique_ptr< HANDLE, heap_deleter > heap_;        
+        std::unique_ptr< HANDLE, heap_deleter > heap_;
         std::vector< uint32_t > heap_page_refs_;
 
         LPVOID base_address_;

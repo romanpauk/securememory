@@ -33,7 +33,7 @@ endmacro()
 find_package(Boost)
 if(Boost_FOUND)
     add_executable(securememorytest
-        test/pch.h    
+        test/pch.h
         test/securememory.cpp
         test/testmodule.cpp
     )
@@ -41,7 +41,7 @@ if(Boost_FOUND)
     add_test(securememorytest COMMAND securememorytest)
     target_link_libraries(securememorytest securememory Boost::boost)
     target_include_directories(securememorytest PRIVATE test)
-    target_precompile_headers(securememorytest PRIVATE test/pch.h)    
+    target_precompile_headers(securememorytest PRIVATE test/pch.h)
 
     if(WIN32)
         group_sources(include)

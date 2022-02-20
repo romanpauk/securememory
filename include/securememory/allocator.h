@@ -17,12 +17,12 @@ namespace securememory
         allocator() noexcept
             : heap_(global_heap())
         {}
-        
+
         allocator(Heap* heap) noexcept
             : heap_(heap)
         {}
 
-        template <class U> allocator(allocator<U, Heap> const& other) noexcept 
+        template <class U> allocator(allocator<U, Heap> const& other) noexcept
             : heap_(other.heap_)
         {}
 
@@ -42,7 +42,7 @@ namespace securememory
             return ptr;
         }
 
-        void deallocate(value_type* p, std::size_t n) noexcept 
+        void deallocate(value_type* p, std::size_t n) noexcept
         {
             heap_->deallocate(p, n * sizeof(value_type));
         }

@@ -12,7 +12,7 @@ BOOST_AUTO_TEST_CASE(allocator_locked_test)
 {
     securememory::win32::heap heap(1 << 20);
     securememory::allocator< char > allocator(&heap);
-    
+
     BOOST_CHECK(heap.locked_size() == 0);
 
     const size_t count = 64;
@@ -48,12 +48,12 @@ BOOST_AUTO_TEST_CASE(vector_test)
     BOOST_CHECK_THROW(vec.reserve(size * 200), std::bad_alloc);
 }
 
-namespace securememory 
-{ 
-    win32::heap* global_heap() 
+namespace securememory
+{
+    win32::heap* global_heap()
     {
-        static win32::heap heap(1 << 20); 
-        return &heap; 
+        static win32::heap heap(1 << 20);
+        return &heap;
     }
 }
 
