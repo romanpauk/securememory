@@ -62,6 +62,8 @@ namespace securememory::win32
         };
 
     public:
+        static constexpr std::size_t alignment = MEMORY_ALLOCATION_ALIGNMENT;
+
         heap(std::size_t reserve)
             : allocated_()
         {

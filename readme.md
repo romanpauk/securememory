@@ -15,4 +15,5 @@ Limitations:
 
 - the amount of memory that will be reserved for allocator needs to have a known upper bound. Pages will not be commited
   or locked until requested but the reference counting implementation requires fixed number of consecutive pages
-- the heap implementation is provided by Win32 Heap, so it shares limits of Win32 Heaps
+- the heap implementation is provided by Win32 Heap, so it shares limits of Win32 Heaps. As the heap is non-growable,
+  maximum allocation size it can provide must be less than 0x7FFF8.

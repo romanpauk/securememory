@@ -18,6 +18,8 @@ namespace securememory
     {
         template <class U, class Heap > friend class allocator;
 
+        static_assert(alignof(T) <= Heap::alignment);
+
     public:
         using value_type    = T;
 
