@@ -12,7 +12,7 @@
 // HEAP_LOCK_MULTIPLE works on block of pages, minimizing number of VirtualLock/Unlock calls.
 // But the code is slightly more complex than simple version working page-by-page.
 #define HEAP_LOCK_MULTIPLE
-#define HEAP_VERIFY
+// #define HEAP_VERIFY
 
 #if !defined(HEAP_VERIFY)
 #if defined(_DEBUG)
@@ -228,7 +228,7 @@ namespace securememory::win32
 
                 do
                 {
-                    auto count = heap_pages_[index].refs.load();
+                    auto count = heap_pages_[index].refs.load(std::memory_order_relaxed);
                     if (count == 0)
                     {
                         if (range[1].first)
@@ -240,7 +240,7 @@ namespace securememory::win32
                         // The lock is needed as in deallocate, we might mistakenly unlock the page from memory.
 
                         heap_pages_[index].lock.lock();
-                        if (heap_pages_[index].refs.load() == 0)
+                        if (heap_pages_[index].refs.load(std::memory_order_acquire) == 0)
                         {
                             // The page is still not in the memory, keep it locked and add it to the range
                             range[0].first += 1;
@@ -259,7 +259,7 @@ namespace securememory::win32
                             goto out;
                         }
 
-                        if (heap_pages_[index].refs.compare_exchange_strong(count, count + 1))
+                        if (heap_pages_[index].refs.compare_exchange_weak(count, count + 1, std::memory_order_release))
                         {
                             // As refcount was properly increased from count to count + 1 the page is in the memory.
                             // We do not fetch_add here as that would allow fetch_add to go from 0 to 1, while not locking
@@ -305,7 +305,7 @@ namespace securememory::win32
 
                 do
                 {
-                    auto count = heap_pages_[index].refs.load();
+                    auto count = heap_pages_[index].refs.load(std::memory_order_relaxed);
                     if (count == 1)
                     {
                         if (range[1].first)
@@ -314,10 +314,10 @@ namespace securememory::win32
                             goto out;
                         }
 
-                        if (heap_pages_[index].refs.compare_exchange_strong(count, 0))
+                        if (heap_pages_[index].refs.compare_exchange_weak(count, 0, std::memory_order_release))
                         {
                             heap_pages_[index].lock.lock();
-                            if (heap_pages_[index].refs.load() == 0)
+                            if (heap_pages_[index].refs.load(std::memory_order_acquire) == 0)
                             {
                                 // The page refcount was not incremented in the meantime, add to range to unlock from memory.
                                 range[0].first += 1;
@@ -344,7 +344,7 @@ namespace securememory::win32
                             goto out;
                         }
 
-                        if (heap_pages_[index].refs.compare_exchange_strong(count, count - 1))
+                        if (heap_pages_[index].refs.compare_exchange_weak(count, count - 1, std::memory_order_release))
                         {
                             range[1].first += 1;
                             break;
@@ -418,7 +418,7 @@ namespace securememory::win32
 
                 do
                 {
-                    auto count = heap_pages_[index].refs.load();
+                    auto count = heap_pages_[index].refs.load(std::memory_order_relaxed);
                     if (count == 0)
                     {
                         // Page is not locked in memory. Get lock on the page and lock it in memory.
@@ -426,7 +426,7 @@ namespace securememory::win32
 
                         std::unique_lock< std::mutex > lock(heap_pages_[index].lock);
 
-                        if (heap_pages_[index].refs.load() == 0)
+                        if (heap_pages_[index].refs.load(std::memory_order_acquire) == 0)
                         {
                             if (!VirtualLock(reinterpret_cast<LPVOID>(address), get_page_size()))
                             {
@@ -445,10 +445,10 @@ namespace securememory::win32
                             }
                         }
 
-                        heap_pages_[index].refs.fetch_add(1);
+                        heap_pages_[index].refs.fetch_add(1, std::memory_order_release);
                         break;
                     }
-                    else if (heap_pages_[index].refs.compare_exchange_strong(count, count + 1))
+                    else if (heap_pages_[index].refs.compare_exchange_weak(count, count + 1, std::memory_order_release))
                     {
                         // Page seemed to be locked and as refcount was properly increased from count to count + 1 it really is.
                         // We do not fetch_add here as that could cause fetch_add to set refcount to 1, even though the page was
@@ -500,13 +500,13 @@ namespace securememory::win32
             {
                 uintptr_t index = (address - base) / get_page_size();
 
-                auto count = heap_pages_[index].refs.fetch_sub(1);
+                auto count = heap_pages_[index].refs.fetch_sub(1, std::memory_order_release);
                 if (count == 1)
                 {
                     // Refcount is 0 now, the page should be unlocked from memory.
                     std::lock_guard< std::mutex > lock(heap_pages_[index].lock);
 
-                    if (heap_pages_[index].refs.load() == 0)
+                    if (heap_pages_[index].refs.load(std::memory_order_acquire) == 0)
                     {
                         // Refcount is really 0 and as any potential increment is under lock, we can safely unlock it from memory.
                         if (!VirtualUnlock(reinterpret_cast<LPVOID>(address), get_page_size()))
