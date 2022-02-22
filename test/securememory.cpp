@@ -37,6 +37,11 @@ BOOST_AUTO_TEST_CASE(heap_VirtualLock)
 BOOST_AUTO_TEST_CASE(heap_test)
 {
     BOOST_CHECK(securememory::win32::heap::get_page_size() == 4096);
+    BOOST_CHECK(securememory::win32::heap::get_pages(1) == 1);
+    BOOST_CHECK(securememory::win32::heap::get_pages(4096) == 1);
+    BOOST_CHECK(securememory::win32::heap::get_pages(4097) == 2);
+    BOOST_CHECK(securememory::win32::heap::get_pages(8192) == 2);
+    BOOST_CHECK(securememory::win32::heap::get_pages(8193) == 3);
 
     securememory::win32::heap heap(1 << 30);
     void * p = heap.allocate(32768);

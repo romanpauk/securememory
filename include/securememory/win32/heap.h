@@ -9,9 +9,6 @@
 #include <stdexcept>
 #include <mutex>
 
-// HEAP_LOCK_MULTIPLE works on block of pages, minimizing number of VirtualLock/Unlock calls.
-// But the code is slightly more complex than simple version working page-by-page.
-#define HEAP_LOCK_MULTIPLE
 // #define HEAP_VERIFY
 
 #if !defined(HEAP_VERIFY)
@@ -184,10 +181,11 @@ namespace securememory::win32
             return base_address_;
         }
 
+        // TODO: this does not report correct number as not every page is counted because of how ranges are tracked.
         std::size_t get_locked_size() const
         {
             std::size_t count = 0;
-            for (std::size_t i = 0; i < (size_ + get_page_size()) / get_page_size(); ++i)
+            for (std::size_t i = 0; i < get_pages(size_); ++i)
             {
                 count += heap_pages_[i].refs > 0;
             }
@@ -207,325 +205,205 @@ namespace securememory::win32
             return page_mask;
         }
 
+        static std::size_t get_pages(std::size_t size)
+        {
+            return (size + get_page_size() - 1) / get_page_size();
+        }
+
     private:
-    #if defined(HEAP_LOCK_MULTIPLE)
-        //
-        // Returns block of pages that all either:
-        //     a) have refcount = 0 and are locked (to be locked in ram)
-        //     b) have refcount > 0 and are not locked (as they are locked in ram already)
-        // The code tries to accumulate as large block as possible where all pages have
-        // the same property - a) or b).
-        //
-        std::pair< std::size_t, bool > acquire_pages(uintptr_t address, std::size_t pages)
+        // If page needs to be locked in the memory, lock the mutex and return true
+        // If page is already in the memory increment the refcount and return false
+        bool acquire_page(uintptr_t address)
         {
             uintptr_t base = get_base_address();
+            uintptr_t index = (address - base) / get_page_size();
 
-            std::pair< std::size_t, const bool > range[] = { { 0, true }, { 0, false } };
-
-            for (size_t i = 0; i < pages; ++i)
+            do
             {
-                uintptr_t index = (address + i * get_page_size() - base) / get_page_size();
-
-                do
+                // Check if count is 0 and page needs locking.
+                auto count = heap_pages_[index].refs.load(std::memory_order_relaxed);
+                if (count == 0)
                 {
-                    auto count = heap_pages_[index].refs.load(std::memory_order_relaxed);
-                    if (count == 0)
+                    // Get exclusive access to the page
+                    heap_pages_[index].lock.lock();
+
+                    // Check that it is still 0
+                    if (heap_pages_[index].refs.load(std::memory_order_acquire) == 0)
                     {
-                        if (range[1].first)
-                        {
-                            goto out;
-                        }
-
-                        // Page is not locked in memory. Get lock on the page.
-                        // The lock is needed as in deallocate, we might mistakenly unlock the page from memory.
-
-                        heap_pages_[index].lock.lock();
-                        if (heap_pages_[index].refs.load(std::memory_order_acquire) == 0)
-                        {
-                            // The page is still not in the memory, keep it locked and add it to the range
-                            range[0].first += 1;
-                            break;
-                        }
-                        else
-                        {
-                            // Page refcount was incremented in the meantime. Try again.
-                            heap_pages_[index].lock.unlock();
-                        }
+                        // The refcount should be incremented after the page is locked in the memory.
+                        // Return 'locked' page.
+                        return true;
                     }
-                    else
-                    {
-                        if (range[0].first)
-                        {
-                            goto out;
-                        }
 
-                        if (heap_pages_[index].refs.compare_exchange_weak(count, count + 1, std::memory_order_release))
-                        {
-                            // As refcount was properly increased from count to count + 1 the page is in the memory.
-                            // We do not fetch_add here as that would allow fetch_add to go from 0 to 1, while not locking
-                            // the page in memory.
+                    // The page got locked in the meantime
+                    heap_pages_[index].refs.fetch_add(1, std::memory_order_release);
+                    heap_pages_[index].lock.unlock();
+                    break;
+                }
+                else if (heap_pages_[index].refs.compare_exchange_weak(count, count + 1, std::memory_order_release))
+                {
+                    // Use cas instead of fetch so we do not increment the refcount without locking.
+                    break;
+                }
+            } while (true);
 
-                            range[1].first += 1;
-                            break;
-                        }
-                    }
-                } while (true);
-            }
-
-            // Return the accumulated range
-        out:
-            if (range[0].first)
-            {
-                HEAP_ASSERT(range[1].first == 0);
-                HEAP_ASSERT(verify_refcounts(address, range[0].first, range[0].second));
-                return range[0];
-            }
-            else
-            {
-                HEAP_ASSERT(range[0].first == 0);
-                HEAP_ASSERT(verify_refcounts(address, range[0].first, range[0].second));
-                return range[1];
-            }
+            return false;
         }
 
-        //
-        // The same as acquire_pages() but for deallocation, returns block of pages that all either:
-        //      a) have refcount = 0 after decrementing and are locked (to be unlocked from memory)
-        //      b) have refcount > 0 after decrementing and are not locked (as they will stay locked in memory)
-        //
-        std::pair< std::size_t, bool > release_pages(uintptr_t address, std::size_t pages)
+        // Called after page is locked in the memory. If lock was successful, refcount should be incremented.
+        void unlock_page(uintptr_t address, bool increment)
         {
             uintptr_t base = get_base_address();
+            uintptr_t index = (address - base) / get_page_size();
 
-            std::pair< std::size_t, const bool > range[] = { { 0, true }, { 0, false } };
-
-            for (size_t i = 0; i < pages; ++i)
+            if (increment)
             {
-                uintptr_t index = (address + i * get_page_size() - base) / get_page_size();
-
-                do
-                {
-                    auto count = heap_pages_[index].refs.load(std::memory_order_relaxed);
-                    if (count == 1)
-                    {
-                        if (range[1].first)
-                        {
-                            // If there is a previous range, return it.
-                            goto out;
-                        }
-
-                        if (heap_pages_[index].refs.compare_exchange_weak(count, 0, std::memory_order_release))
-                        {
-                            heap_pages_[index].lock.lock();
-                            if (heap_pages_[index].refs.load(std::memory_order_acquire) == 0)
-                            {
-                                // The page refcount was not incremented in the meantime, add to range to unlock from memory.
-                                range[0].first += 1;
-                                break;
-                            }
-                            else
-                            {
-                                // The page refcount was incremented in the meantime. Try again.
-                                heap_pages_[index].lock.unlock();
-                            }
-                        }
-                        else
-                        {
-                            // The page refcount was incremented in the meantime. Try again.
-                        }
-                    }
-                    else
-                    {
-                        HEAP_ASSERT(count > 1);
-
-                        if (range[0].first)
-                        {
-                            // If there is a previous range, return it.
-                            goto out;
-                        }
-
-                        if (heap_pages_[index].refs.compare_exchange_weak(count, count - 1, std::memory_order_release))
-                        {
-                            range[1].first += 1;
-                            break;
-                        }
-                    }
-                } while (true);
+                heap_pages_[index].refs.fetch_add(1);
             }
 
-            // Return the accumulated range
-        out:
-            if (range[0].first)
-            {
-                HEAP_ASSERT(range[1].first == 0);
-                HEAP_ASSERT(verify_refcounts(address, range[0].first, range[0].second));
-                return range[0];
-            }
-            else
-            {
-                HEAP_ASSERT(range[0].first == 0);
-                HEAP_ASSERT(verify_refcounts(address, range[0].first, range[0].second));
-                return range[1];
-            }
+            heap_pages_[index].lock.unlock();
         }
 
-        void unlock_pages(uintptr_t address, std::size_t pages, uint16_t refcount)
+        // Returns true and keep the page locked in case it should be unlocked from the memory.
+        // Returns false in case the refcount was decremented.
+        bool release_page(uintptr_t address)
         {
             uintptr_t base = get_base_address();
+            uintptr_t index = (address - base) / get_page_size();
 
-            for (size_t i = 0; i < pages; ++i)
+            // Check if we went from 1 to 0
+            if (heap_pages_[index].refs.fetch_sub(1, std::memory_order_release) == 1)
             {
-                uintptr_t index = (address + i * get_page_size() - base) / get_page_size();
-
-                if (refcount)
+                // Get exclusive access to the page
+                heap_pages_[index].lock.lock();
+                if (heap_pages_[index].refs.load(std::memory_order_acquire) == 0)
                 {
-                    heap_pages_[index].refs.fetch_add(refcount);
+                    // We really went to 0
+                    return true;
                 }
 
+                // Someone incremented the refcount in the meantime.
                 heap_pages_[index].lock.unlock();
             }
-        }
-    #endif
 
+            return false;
+        }
+
+        //
+        // Locking and unlocking works on whole ranges. It is enough to increment refcount on first
+        // and on the last page of the range, as by getting the memory from heap, the allocation is exclusive.
+        // Only first and last page of the range can be shared with some other allocation. This is minor
+        // complication in unlock_address_range function where we need to watch for different sharing cases
+        // while unlocking page from memory.
+        //
+        // Because we work only with first and last page and their address is known, hashtable can be used.
+        // Resizable hashtable is needed to support unbounded heaps.
+        //
         bool lock_address_range(void* ptr, std::size_t size)
         {
-            uintptr_t address = reinterpret_cast<uintptr_t>(ptr) & get_page_mask();
-            uintptr_t base = get_base_address();
-            std::size_t pages = (size + get_page_size()) / get_page_size();
+            const uintptr_t first = reinterpret_cast<uintptr_t>(ptr) & get_page_mask();
+            const auto pages = get_pages(size);
+            const uintptr_t last = first + (pages - 1) * get_page_size();
 
-        #if defined(HEAP_LOCK_MULTIPLE)
-            while(pages)
+            bool lock[2] = {};
+
+            // Get first page
+            lock[0] = acquire_page(first);
+            if (pages > 1)
             {
-                auto [n, locked] = acquire_pages(address, pages);
-                if (locked)
-                {
-                    if (!VirtualLock(reinterpret_cast<LPVOID>(address), n * get_page_size()))
-                    {
-                        unlock_pages(address, n, 0);
-                        return false;
-                    }
+                // Get second page
+                lock[1] = acquire_page(last);
+            }
 
-                    unlock_pages(address, n, 1);
+            // If either one of the pages should be locked, lock them both
+            if (lock[0] || lock[1])
+            {
+                // It is possible to call VirtualLock multiple times for the same pages
+                // (unfortunatelly not true for VirtualUnlock).
+                bool result = VirtualLock(reinterpret_cast<LPVOID>(first), pages * get_page_size()) == TRUE;
+                if(!result)
+                {
+                    HEAP_ASSERT(false);
                 }
 
-                address += n * get_page_size();
-                pages -= n;
-            }
-        #else
-            for (size_t i = 0; i < pages; ++i, address += get_page_size())
-            {
-                uintptr_t index = (address - base) / get_page_size();
-
-                do
+                // Either increment the refcounts, or clear the locks.
+                if (lock[0])
                 {
-                    auto count = heap_pages_[index].refs.load(std::memory_order_relaxed);
-                    if (count == 0)
-                    {
-                        // Page is not locked in memory. Get lock on the page and lock it in memory.
-                        // The lock is needed as in deallocate, we might mistakenly unlock the page from memory.
+                    unlock_page(first, result);
+                }
 
-                        std::unique_lock< std::mutex > lock(heap_pages_[index].lock);
+                if (lock[1])
+                {
+                    unlock_page(last, result);
+                }
 
-                        if (heap_pages_[index].refs.load(std::memory_order_acquire) == 0)
-                        {
-                            if (!VirtualLock(reinterpret_cast<LPVOID>(address), get_page_size()))
-                            {
-                                // We failed to lock the pages in memory so we don't have a secure allocation.
-                                // Unlock all but last page we tried to lock.
-
-                                HEAP_ASSERT(false);
-
-                                if (i > 0)
-                                {
-                                    lock.unlock();
-                                    unlock_address_range(ptr, i * get_page_size());
-                                }
-
-                                return false;
-                            }
-                        }
-
-                        heap_pages_[index].refs.fetch_add(1, std::memory_order_release);
-                        break;
-                    }
-                    else if (heap_pages_[index].refs.compare_exchange_weak(count, count + 1, std::memory_order_release))
-                    {
-                        // Page seemed to be locked and as refcount was properly increased from count to count + 1 it really is.
-                        // We do not fetch_add here as that could cause fetch_add to set refcount to 1, even though the page was
-                        // just unlocked from memory.
-                        break;
-                    }
-                    else
-                    {
-                        // Someone else either decreased or increased the refcount, try again.
-                        continue;
-                    }
-                } while (true);
+                if (!result)
+                {
+                    return result;
+                }
             }
-        #endif
 
-            HEAP_ASSERT(verify_refcounts(reinterpret_cast<uintptr_t>(ptr) & get_page_mask(), (size + get_page_size()) / get_page_size(), false));
-            HEAP_ASSERT(verify_locked(reinterpret_cast<uintptr_t>(ptr)& get_page_mask(), (size + get_page_size()) / get_page_size(), true));
+            HEAP_ASSERT(verify_refcounts(first, pages, false));
+            HEAP_ASSERT(verify_locked(first, pages, true));
             return true;
         }
 
         void unlock_address_range(void* ptr, std::size_t size)
         {
-            uintptr_t address = reinterpret_cast<uintptr_t>(ptr) & get_page_mask();
-            uintptr_t base = get_base_address();
-            std::size_t pages = (size + get_page_size()) / get_page_size();
+            uintptr_t first = reinterpret_cast<uintptr_t>(ptr) & get_page_mask();
+            const auto pages = get_pages(size);
+            const uintptr_t last = first + (pages - 1) * get_page_size();
 
-            HEAP_ASSERT(verify_refcounts(reinterpret_cast<uintptr_t>(ptr) & get_page_mask(), (size + get_page_size()) / get_page_size(), false));
-            HEAP_ASSERT(verify_locked(reinterpret_cast<uintptr_t>(ptr) & get_page_mask(), (size + get_page_size()) / get_page_size(), true));
+            HEAP_ASSERT(verify_refcounts(first, pages, false));
+            HEAP_ASSERT(verify_locked(first, pages, true));
 
-        #if defined(HEAP_LOCK_MULTIPLE)
-            while (pages)
+            bool lock[2] = {};
+            // Get first page
+            lock[0] = release_page(first);
+            if (pages == 1)
             {
-                auto [n, locked] = release_pages(address, pages);
-                if (locked)
+                if (lock[0] && !VirtualUnlock(reinterpret_cast<LPVOID>(first), pages * get_page_size()))
                 {
-                    if (!VirtualUnlock(reinterpret_cast<LPVOID>(address), n * get_page_size()))
-                    {
-                        HEAP_ASSERT(false);
-                    }
-
-                    unlock_pages(address, n, 0);
+                    HEAP_ASSERT(false);
                 }
-
-                address += n * get_page_size();
-                pages -= n;
             }
-        #else
-            for (size_t i = 0; i < pages; ++i, address += get_page_size())
+            else
             {
-                uintptr_t index = (address - base) / get_page_size();
+                // Get last page
+                lock[1] = release_page(last);
 
-                auto count = heap_pages_[index].refs.fetch_sub(1, std::memory_order_release);
-                if (count == 1)
+                // Deal with the cases when first or last pages are shared with other allocation. That means
+                // They cannot be unlocked.
+
+                if (lock[0] && lock[1] && !VirtualUnlock(reinterpret_cast<LPVOID>(first), pages * get_page_size())) // Whole range
                 {
-                    // Refcount is 0 now, the page should be unlocked from memory.
-                    std::lock_guard< std::mutex > lock(heap_pages_[index].lock);
-
-                    if (heap_pages_[index].refs.load(std::memory_order_acquire) == 0)
-                    {
-                        // Refcount is really 0 and as any potential increment is under lock, we can safely unlock it from memory.
-                        if (!VirtualUnlock(reinterpret_cast<LPVOID>(address), get_page_size()))
-                        {
-                            // The fact that we failed to unlock a page from memory may be serious.
-                            HEAP_ASSERT(false);
-                        }
-                    }
-                    else
-                    {
-                        // Someone incremented the refcount, don't unlock the page from memory
-                    }
+                    HEAP_ASSERT(false);
+                }
+                else if (lock[0] && !lock[1] && !VirtualUnlock(reinterpret_cast<LPVOID>(first), (pages - 1) * get_page_size())) // Whole range except last page
+                {
+                    HEAP_ASSERT(false);
+                }
+                else if (!lock[0] && lock[1] && !VirtualUnlock(reinterpret_cast<LPVOID>(first + get_page_size()), (pages - 1) * get_page_size())) // Whole range except first page
+                {
+                    HEAP_ASSERT(false);
+                }
+                else if (pages > 2 && !VirtualUnlock(reinterpret_cast<LPVOID>(first + get_page_size()), (pages - 2) * get_page_size())) // Whole range except first and last
+                {
+                    HEAP_ASSERT(false);
                 }
                 else
                 {
-                    HEAP_ASSERT(count > 1);
+                    // This is hopefully unreachable
+                    HEAP_ASSERT(false);
                 }
             }
-        #endif
+
+            // Cleanup locks if needed
+            if (lock[0])
+                unlock_page(first, false);
+
+            if (lock[1])
+                unlock_page(last, false);
         }
 
         // Needs to be called before any allocations are made.
@@ -562,20 +440,26 @@ namespace securememory::win32
         }
 
     #if defined(HEAP_VERIFY)
+        // Check that pages have proper refcounts
         bool verify_refcounts(uintptr_t address, std::size_t pages, bool zero)
         {
             uintptr_t base = get_base_address();
 
-            for (size_t i = 0; i < pages; ++i)
+            // Check proper refcount on first page
+            uintptr_t index = (address - base) / get_page_size();
+            auto refcount = heap_pages_[index].refs.load();
+            HEAP_ASSERT(zero ? refcount == 0 : refcount > 0);
+            if (pages > 1)
             {
-                uintptr_t index = (address + i * get_page_size() - base) / get_page_size();
-                auto refcount = heap_pages_[index].refs.load();
+                index = (address + (pages-1)*get_page_size() - base) / get_page_size();
+                refcount = heap_pages_[index].refs.load();
                 HEAP_ASSERT(zero ? refcount == 0 : refcount > 0);
             }
 
             return true;
         }
 
+        // Check that pages are locked in the memory
         bool verify_locked(uintptr_t address, std::size_t pages, bool locked)
         {
             std::vector< PSAPI_WORKING_SET_EX_INFORMATION > wset(pages);
