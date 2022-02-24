@@ -43,6 +43,9 @@ BOOST_AUTO_TEST_CASE(heap_test)
     BOOST_CHECK(securememory::win32::heap::get_pages(8192) == 2);
     BOOST_CHECK(securememory::win32::heap::get_pages(8193) == 3);
 
+    BOOST_CHECK(~securememory::win32::heap::get_page_size_mask() + 1 == securememory::win32::heap::get_page_size());
+    BOOST_CHECK((1234 << securememory::win32::heap::get_page_size_log()) == (1234 * securememory::win32::heap::get_page_size()));
+
     securememory::win32::heap heap(1 << 30);
     void * p = heap.allocate(32768);
     heap.deallocate(p, 32768);

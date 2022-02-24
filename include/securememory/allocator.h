@@ -7,6 +7,8 @@
 
 // std::allocator interface is based on https://howardhinnant.github.io/allocator_boilerplate.html
 
+#pragma once
+
 #if defined(_WIN32)
 #include <securememory/win32/heap.h>
 #endif

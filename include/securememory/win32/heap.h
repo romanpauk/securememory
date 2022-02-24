@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
 
+#pragma once
+
 #include <cassert>
 #include <stdexcept>
 #include <mutex>
@@ -199,7 +201,13 @@ namespace securememory::win32
             return page_size;
         }
 
-        static uintptr_t get_page_mask()
+        static uintptr_t get_page_size_log()
+        {
+            static const uintptr_t page_size_log = _tzcnt_u64(get_page_size());
+            return page_size_log;
+        }
+
+        static uintptr_t get_page_size_mask()
         {
             static const uintptr_t page_mask = ~(get_page_size() - 1);
             return page_mask;
@@ -207,7 +215,7 @@ namespace securememory::win32
 
         static std::size_t get_pages(std::size_t size)
         {
-            return (size + get_page_size() - 1) / get_page_size();
+            return (size + get_page_size() - 1) >> get_page_size_log();
         }
 
     private:
@@ -216,7 +224,7 @@ namespace securememory::win32
         bool acquire_page(uintptr_t address)
         {
             uintptr_t base = get_base_address();
-            uintptr_t index = (address - base) / get_page_size();
+            uintptr_t index = (address - base) >> get_page_size_log();
 
             do
             {
@@ -254,11 +262,11 @@ namespace securememory::win32
         void unlock_page(uintptr_t address, bool increment)
         {
             uintptr_t base = get_base_address();
-            uintptr_t index = (address - base) / get_page_size();
+            uintptr_t index = (address - base) >> get_page_size_log();
 
             if (increment)
             {
-                heap_pages_[index].refs.fetch_add(1);
+                heap_pages_[index].refs.fetch_add(1, std::memory_order_release);
             }
 
             heap_pages_[index].lock.unlock();
@@ -269,7 +277,7 @@ namespace securememory::win32
         bool release_page(uintptr_t address)
         {
             uintptr_t base = get_base_address();
-            uintptr_t index = (address - base) / get_page_size();
+            uintptr_t index = (address - base) >> get_page_size_log();
 
             // Check if we went from 1 to 0
             if (heap_pages_[index].refs.fetch_sub(1, std::memory_order_release) == 1)
@@ -301,9 +309,9 @@ namespace securememory::win32
         //
         bool lock_address_range(void* ptr, std::size_t size)
         {
-            const uintptr_t first = reinterpret_cast<uintptr_t>(ptr) & get_page_mask();
+            const uintptr_t first = reinterpret_cast<uintptr_t>(ptr) & get_page_size_mask();
             const auto pages = get_pages(size);
-            const uintptr_t last = first + (pages - 1) * get_page_size();
+            const uintptr_t last = first + ((pages - 1) << get_page_size_log());
 
             bool lock[2] = {};
 
@@ -320,7 +328,7 @@ namespace securememory::win32
             {
                 // It is possible to call VirtualLock multiple times for the same pages
                 // (unfortunatelly not true for VirtualUnlock).
-                bool result = VirtualLock(reinterpret_cast<LPVOID>(first), pages * get_page_size()) == TRUE;
+                bool result = VirtualLock(reinterpret_cast<LPVOID>(first), pages << get_page_size_log()) == TRUE;
                 if(!result)
                 {
                     HEAP_ASSERT(false);
@@ -350,9 +358,9 @@ namespace securememory::win32
 
         void unlock_address_range(void* ptr, std::size_t size)
         {
-            uintptr_t first = reinterpret_cast<uintptr_t>(ptr) & get_page_mask();
+            uintptr_t first = reinterpret_cast<uintptr_t>(ptr) & get_page_size_mask();
             const auto pages = get_pages(size);
-            const uintptr_t last = first + (pages - 1) * get_page_size();
+            const uintptr_t last = first + ((pages - 1) << get_page_size_log());
 
             HEAP_ASSERT(verify_refcounts(first, pages, false));
             HEAP_ASSERT(verify_locked(first, pages, true));
@@ -362,7 +370,7 @@ namespace securememory::win32
             lock[0] = release_page(first);
             if (pages == 1)
             {
-                if (lock[0] && !VirtualUnlock(reinterpret_cast<LPVOID>(first), pages * get_page_size()))
+                if (lock[0] && !VirtualUnlock(reinterpret_cast<LPVOID>(first), pages << get_page_size_log()))
                 {
                     HEAP_ASSERT(false);
                 }
@@ -375,21 +383,25 @@ namespace securememory::win32
                 // Deal with the cases when first or last pages are shared with other allocation. That means
                 // They cannot be unlocked.
 
-                if (lock[0] && lock[1] && !VirtualUnlock(reinterpret_cast<LPVOID>(first), pages * get_page_size())) // Whole range
+                if (lock[0] && lock[1]) // Whole range
                 {
-                    HEAP_ASSERT(false);
+                    if(!VirtualUnlock(reinterpret_cast<LPVOID>(first), pages << get_page_size_log()))
+                        HEAP_ASSERT(false);
                 }
-                else if (lock[0] && !lock[1] && !VirtualUnlock(reinterpret_cast<LPVOID>(first), (pages - 1) * get_page_size())) // Whole range except last page
+                else if (lock[0] && !lock[1]) // Whole range except last page
                 {
-                    HEAP_ASSERT(false);
+                    if(!VirtualUnlock(reinterpret_cast<LPVOID>(first), (pages - 1) << get_page_size_log()))
+                        HEAP_ASSERT(false);
                 }
-                else if (!lock[0] && lock[1] && !VirtualUnlock(reinterpret_cast<LPVOID>(first + get_page_size()), (pages - 1) * get_page_size())) // Whole range except first page
+                else if (!lock[0] && lock[1]) // Whole range except first page
                 {
-                    HEAP_ASSERT(false);
+                    if(!VirtualUnlock(reinterpret_cast<LPVOID>(first + get_page_size()), (pages - 1) << get_page_size_log()))
+                        HEAP_ASSERT(false);
                 }
-                else if (pages > 2 && !VirtualUnlock(reinterpret_cast<LPVOID>(first + get_page_size()), (pages - 2) * get_page_size())) // Whole range except first and last
+                else if (pages > 2) // Whole range except first and last
                 {
-                    HEAP_ASSERT(false);
+                    if(!VirtualUnlock(reinterpret_cast<LPVOID>(first + get_page_size()), (pages - 2) << get_page_size_log()))
+                        HEAP_ASSERT(false);
                 }
                 else
                 {
@@ -420,7 +432,7 @@ namespace securememory::win32
                     size = entry.Region.dwUnCommittedSize + entry.Region.dwCommittedSize;
 
                     HEAP_ASSERT(base == 0);
-                    base = reinterpret_cast< uintptr_t >(entry.lpData) & get_page_mask();
+                    base = reinterpret_cast< uintptr_t >(entry.lpData) & get_page_size_mask();
 
                     // Walk it till the end to get proper error code
                 }
@@ -441,19 +453,24 @@ namespace securememory::win32
 
     #if defined(HEAP_VERIFY)
         // Check that pages have proper refcounts
-        bool verify_refcounts(uintptr_t address, std::size_t pages, bool zero)
+        bool verify_refcount(uintptr_t address, bool zero)
         {
             uintptr_t base = get_base_address();
 
             // Check proper refcount on first page
-            uintptr_t index = (address - base) / get_page_size();
-            auto refcount = heap_pages_[index].refs.load();
+            uintptr_t index = (address - base) >> get_page_size_log();
+            auto refcount = heap_pages_[index].refs.load(std::memory_order_relaxed);
             HEAP_ASSERT(zero ? refcount == 0 : refcount > 0);
+            return true;
+        }
+
+        bool verify_refcounts(uintptr_t address, std::size_t pages, bool zero)
+        {
+            // Check proper refcount on first page
+            HEAP_ASSERT(verify_refcount(address, zero));
             if (pages > 1)
             {
-                index = (address + (pages-1)*get_page_size() - base) / get_page_size();
-                refcount = heap_pages_[index].refs.load();
-                HEAP_ASSERT(zero ? refcount == 0 : refcount > 0);
+                HEAP_ASSERT(verify_refcount(address + ((pages - 1) << get_page_size_log()), zero));
             }
 
             return true;
@@ -466,7 +483,7 @@ namespace securememory::win32
             ZeroMemory(&wset[0], wset.size());
             for (std::size_t i = 0; i < pages; ++i)
             {
-                wset[i].VirtualAddress = reinterpret_cast< PVOID >(address + i * get_page_size());
+                wset[i].VirtualAddress = reinterpret_cast< PVOID >(address + (i << get_page_size_log()));
             }
 
             if (QueryWorkingSetEx(GetCurrentProcess(), &wset[0], static_cast<DWORD>(sizeof(wset[0]) * wset.size())) == FALSE)
