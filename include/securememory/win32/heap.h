@@ -24,7 +24,7 @@
 #define HEAP_ASSERT(...) do { if(!(__VA_ARGS__)) { HEAP_ABORT(#__VA_ARGS__); } } while(0)
 #include <psapi.h>
 #else
-#define HEAP_ASSERT(...)
+#define HEAP_ASSERT(...) do {} while(0)
 #endif
 
 namespace securememory::win32
@@ -134,7 +134,7 @@ namespace securememory::win32
                 if (lock_address_range(ptr, size))
                 {
                     // Allocated memory is properly locked in memory, return it.
-                    allocated_ += size;
+                    allocated_.fetch_add(size, std::memory_order_relaxed);
                     return ptr;
                 }
                 else
@@ -172,8 +172,8 @@ namespace securememory::win32
                 }
                 else
                 {
-                    HEAP_ASSERT(allocated_ >= size);
-                    allocated_ -= size;
+                    HEAP_ASSERT(allocated_.load(std::memory_order_relaxed) >= size);
+                    allocated_.fetch_sub(size, std::memory_order_relaxed);
                 }
             }
         }
@@ -189,7 +189,7 @@ namespace securememory::win32
             std::size_t count = 0;
             for (std::size_t i = 0; i < get_pages(size_); ++i)
             {
-                count += heap_pages_[i].refs > 0;
+                count += heap_pages_[i].refs.load(std::memory_order_relaxed) > 0;
             }
 
             return count * get_page_size();
@@ -219,9 +219,9 @@ namespace securememory::win32
         }
 
     private:
-        // If page needs to be locked in the memory, lock the mutex and return true
+        // If page needs to be locked in the memory, grab the shared lock and return true
         // If page is already in the memory increment the refcount and return false
-        bool acquire_page(uintptr_t address)
+        bool prepare_page_lock(uintptr_t address)
         {
             uintptr_t base = get_base_address();
             uintptr_t index = (address - base) >> get_page_size_log();
@@ -232,23 +232,24 @@ namespace securememory::win32
                 auto count = heap_pages_[index].refs.load(std::memory_order_relaxed);
                 if (count == 0)
                 {
-                    // Get exclusive access to the page
-                    heap_pages_[index].lock.lock();
+                    lock_read(heap_pages_[index].lock);
 
-                    // Check that it is still 0
-                    if (heap_pages_[index].refs.load(std::memory_order_acquire) == 0)
+                    // Check that refcount is still 0
+                    if (heap_pages_[index].refs.load(std::memory_order_relaxed) == 0)
                     {
                         // The refcount should be incremented after the page is locked in the memory.
                         // Return 'locked' page.
                         return true;
                     }
 
-                    // The page got locked in the meantime
-                    heap_pages_[index].refs.fetch_add(1, std::memory_order_release);
-                    heap_pages_[index].lock.unlock();
+                    // The page got locked in the meantime and because of read lock, it could not get unlocked
+
+                    // Increment refcount
+                    heap_pages_[index].refs.fetch_add(1, std::memory_order_relaxed);
+                    unlock_read(heap_pages_[index].lock);
                     break;
                 }
-                else if (heap_pages_[index].refs.compare_exchange_weak(count, count + 1, std::memory_order_release))
+                else if (heap_pages_[index].refs.compare_exchange_weak(count, count + 1, std::memory_order_acq_rel))
                 {
                     // Use cas instead of fetch so we do not increment the refcount without locking.
                     break;
@@ -259,42 +260,49 @@ namespace securememory::win32
         }
 
         // Called after page is locked in the memory. If lock was successful, refcount should be incremented.
-        void unlock_page(uintptr_t address, bool increment)
+        void clear_page_lock(uintptr_t address, bool success)
         {
             uintptr_t base = get_base_address();
             uintptr_t index = (address - base) >> get_page_size_log();
 
-            if (increment)
+            if (success)
             {
-                heap_pages_[index].refs.fetch_add(1, std::memory_order_release);
+                heap_pages_[index].refs.fetch_add(1, std::memory_order_relaxed);
             }
 
-            heap_pages_[index].lock.unlock();
+            unlock_read(heap_pages_[index].lock);
         }
 
-        // Returns true and keep the page locked in case it should be unlocked from the memory.
+        // Returns true and keep the page exclusively locked in case it should be unlocked from the memory.
         // Returns false in case the refcount was decremented.
-        bool release_page(uintptr_t address)
+        bool prepare_page_unlock(uintptr_t address)
         {
             uintptr_t base = get_base_address();
             uintptr_t index = (address - base) >> get_page_size_log();
 
             // Check if we went from 1 to 0
-            if (heap_pages_[index].refs.fetch_sub(1, std::memory_order_release) == 1)
+            if (heap_pages_[index].refs.fetch_sub(1, std::memory_order_acquire) == 1)
             {
-                // Get exclusive access to the page
-                heap_pages_[index].lock.lock();
-                if (heap_pages_[index].refs.load(std::memory_order_acquire) == 0)
+                if (trylock_write(heap_pages_[index].lock))
                 {
-                    // We really went to 0
-                    return true;
+                    // Check if refcount didn't increased
+                    if (heap_pages_[index].refs.load(std::memory_order_relaxed) == 0)
+                    {
+                        return true;
+                    }
                 }
 
-                // Someone incremented the refcount in the meantime.
-                heap_pages_[index].lock.unlock();
+                unlock_write(heap_pages_[index].lock);
             }
 
             return false;
+        }
+
+        void clear_page_unlock(uintptr_t address)
+        {
+            uintptr_t base = get_base_address();
+            uintptr_t index = (address - base) >> get_page_size_log();
+            unlock_write(heap_pages_[index].lock);
         }
 
         //
@@ -304,9 +312,13 @@ namespace securememory::win32
         // complication in unlock_address_range function where we need to watch for different sharing cases
         // while unlocking page from memory.
         //
-        // Because we work only with first and last page and their address is known, hashtable can be used.
-        // Resizable hashtable is needed to support unbounded heaps.
+        // Attempts to lock page in memory can run in parallel, yet they need to synchronize with attempts
+        // to unlock page from memory.
         //
+        // Because we work only with first and last page and their address is known, hash table can be used.
+        // Resizable hash table is needed to support unbounded heaps.
+        //
+
         bool lock_address_range(void* ptr, std::size_t size)
         {
             const uintptr_t first = reinterpret_cast<uintptr_t>(ptr) & get_page_size_mask();
@@ -316,11 +328,11 @@ namespace securememory::win32
             bool lock[2] = {};
 
             // Get first page
-            lock[0] = acquire_page(first);
+            lock[0] = prepare_page_lock(first);
             if (pages > 1)
             {
                 // Get second page
-                lock[1] = acquire_page(last);
+                lock[1] = prepare_page_lock(last);
             }
 
             // If either one of the pages should be locked, lock them both
@@ -329,21 +341,20 @@ namespace securememory::win32
                 // It is possible to call VirtualLock multiple times for the same pages
                 // (unfortunatelly not true for VirtualUnlock).
                 bool result = VirtualLock(reinterpret_cast<LPVOID>(first), pages << get_page_size_log()) == TRUE;
-                if(!result)
+                if (!result)
                 {
                     HEAP_ASSERT(false);
+
+                    // TODO: it is possible that deallocate did not unlock the page as there was someome who wanted to lock it.
+                    // This failure thus could be a failed lock call for an already locked page. What would that mean?
                 }
 
                 // Either increment the refcounts, or clear the locks.
                 if (lock[0])
-                {
-                    unlock_page(first, result);
-                }
+                    clear_page_lock(first, result);
 
                 if (lock[1])
-                {
-                    unlock_page(last, result);
-                }
+                    clear_page_lock(last, result);
 
                 if (!result)
                 {
@@ -367,7 +378,7 @@ namespace securememory::win32
 
             bool lock[2] = {};
             // Get first page
-            lock[0] = release_page(first);
+            lock[0] = prepare_page_unlock(first);
             if (pages == 1)
             {
                 if (lock[0] && !VirtualUnlock(reinterpret_cast<LPVOID>(first), pages << get_page_size_log()))
@@ -378,29 +389,29 @@ namespace securememory::win32
             else
             {
                 // Get last page
-                lock[1] = release_page(last);
+                lock[1] = prepare_page_unlock(last);
 
-                // Deal with the cases when first or last pages are shared with other allocation. That means
-                // They cannot be unlocked.
+                // Deal with the cases when first or last pages are shared with other allocation.
+                // That means they cannot be unlocked.
 
                 if (lock[0] && lock[1]) // Whole range
                 {
-                    if(!VirtualUnlock(reinterpret_cast<LPVOID>(first), pages << get_page_size_log()))
+                    if (!VirtualUnlock(reinterpret_cast<LPVOID>(first), pages << get_page_size_log()))
                         HEAP_ASSERT(false);
                 }
                 else if (lock[0] && !lock[1]) // Whole range except last page
                 {
-                    if(!VirtualUnlock(reinterpret_cast<LPVOID>(first), (pages - 1) << get_page_size_log()))
+                    if (!VirtualUnlock(reinterpret_cast<LPVOID>(first), (pages - 1) << get_page_size_log()))
                         HEAP_ASSERT(false);
                 }
                 else if (!lock[0] && lock[1]) // Whole range except first page
                 {
-                    if(!VirtualUnlock(reinterpret_cast<LPVOID>(first + get_page_size()), (pages - 1) << get_page_size_log()))
+                    if (!VirtualUnlock(reinterpret_cast<LPVOID>(first + get_page_size()), (pages - 1) << get_page_size_log()))
                         HEAP_ASSERT(false);
                 }
                 else if (pages > 2) // Whole range except first and last
                 {
-                    if(!VirtualUnlock(reinterpret_cast<LPVOID>(first + get_page_size()), (pages - 2) << get_page_size_log()))
+                    if (!VirtualUnlock(reinterpret_cast<LPVOID>(first + get_page_size()), (pages - 2) << get_page_size_log()))
                         HEAP_ASSERT(false);
                 }
                 else
@@ -412,10 +423,10 @@ namespace securememory::win32
 
             // Cleanup locks if needed
             if (lock[0])
-                unlock_page(first, false);
+                clear_page_unlock(first);
 
             if (lock[1])
-                unlock_page(last, false);
+                clear_page_unlock(last);
         }
 
         // Needs to be called before any allocations are made.
@@ -432,9 +443,9 @@ namespace securememory::win32
                     size = entry.Region.dwUnCommittedSize + entry.Region.dwCommittedSize;
 
                     HEAP_ASSERT(base == 0);
-                    base = reinterpret_cast< uintptr_t >(entry.lpData) & get_page_size_mask();
+                    base = reinterpret_cast<uintptr_t>(entry.lpData) & get_page_size_mask();
 
-                    // Walk it till the end to get proper error code
+                    // Walk till the end to get a proper error code
                 }
             }
 
@@ -483,7 +494,7 @@ namespace securememory::win32
             ZeroMemory(&wset[0], wset.size());
             for (std::size_t i = 0; i < pages; ++i)
             {
-                wset[i].VirtualAddress = reinterpret_cast< PVOID >(address + (i << get_page_size_log()));
+                wset[i].VirtualAddress = reinterpret_cast<PVOID>(address + (i << get_page_size_log()));
             }
 
             if (QueryWorkingSetEx(GetCurrentProcess(), &wset[0], static_cast<DWORD>(sizeof(wset[0]) * wset.size())) == FALSE)
@@ -503,16 +514,39 @@ namespace securememory::win32
 
         std::unique_ptr< HANDLE, heap_deleter > heap_;
 
+        // From "Scalable Reader-Writer Synchronization for Shared-Memory Multiprocessors"
+        void lock_read(std::atomic< uint16_t >& lock)
+        {
+            lock.fetch_add(2, std::memory_order_acquire);
+            while (lock.load(std::memory_order_relaxed) & 1);
+        }
+
+        void unlock_read(std::atomic< uint16_t >& lock)
+        {
+            lock.fetch_sub(2, std::memory_order_release);
+        }
+
+        bool trylock_write(std::atomic< uint16_t >& lock)
+        {
+            uint16_t val = 0;
+            return lock.compare_exchange_strong(val, 1, std::memory_order_acq_rel);
+        }
+
+        void unlock_write(std::atomic< uint16_t >& lock)
+        {
+            lock.fetch_sub(1, std::memory_order_release);
+        }
+
         struct heap_page
         {
             heap_page()
                 : refs(0)
+                , lock(0)
             {}
 
+            // TODO: there really cannot be so many references to single page...
             std::atomic< uint16_t > refs;
-
-            // TODO: some smaller lock
-            std::mutex lock;
+            std::atomic< uint16_t > lock;
         };
 
         std::unique_ptr < heap_page[] > heap_pages_;
