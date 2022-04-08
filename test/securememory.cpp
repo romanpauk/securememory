@@ -6,13 +6,21 @@
 //
 
 #include <boost/test/unit_test.hpp>
+#include <boost/mpl/list.hpp>
 
 #include <securememory/allocator.h>
 
 #include <set>
 #include <thread>
 
-BOOST_AUTO_TEST_CASE(heap_VirtualLock)
+using assertion_types = boost::mpl::list <
+#if !defined(_DEBUG)
+    securememory::win32::assertions< false >,
+#endif
+    securememory::win32::assertions< true >
+>;
+
+BOOST_AUTO_TEST_CASE(heap_virtual_lock_unlock)
 {
     uint8_t* ptr = (uint8_t*)VirtualAlloc(0, 8192, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     BOOST_CHECK(ptr);
@@ -34,7 +42,7 @@ BOOST_AUTO_TEST_CASE(heap_VirtualLock)
     BOOST_CHECK(VirtualFree(ptr, 0, MEM_RELEASE));
 }
 
-BOOST_AUTO_TEST_CASE(heap_test)
+BOOST_AUTO_TEST_CASE(heap_test_pagesize)
 {
     BOOST_CHECK(securememory::win32::heap::get_page_size() == 4096);
     BOOST_CHECK(securememory::win32::heap::get_pages(1) == 1);
@@ -45,10 +53,6 @@ BOOST_AUTO_TEST_CASE(heap_test)
 
     BOOST_CHECK(~securememory::win32::heap::get_page_size_mask() + 1 == securememory::win32::heap::get_page_size());
     BOOST_CHECK((1234 << securememory::win32::heap::get_page_size_log()) == (1234 * securememory::win32::heap::get_page_size()));
-
-    securememory::win32::heap heap(1 << 30);
-    void * p = heap.allocate(32768);
-    heap.deallocate(p, 32768);
 }
 
 BOOST_AUTO_TEST_CASE(heap_reserve_test)
@@ -56,10 +60,10 @@ BOOST_AUTO_TEST_CASE(heap_reserve_test)
     BOOST_CHECK_THROW(securememory::win32::heap(0), std::runtime_error);
 }
 
-BOOST_AUTO_TEST_CASE(allocator_locked_test)
+BOOST_AUTO_TEST_CASE_TEMPLATE(allocator_locked_test, Assertion, assertion_types)
 {
-    securememory::win32::heap heap(1 << 20);
-    securememory::allocator< char > allocator(&heap);
+    securememory::win32::basic_heap< Assertion > heap(1 << 20);
+    securememory::allocator< char, decltype(heap) > allocator(&heap);
 
     BOOST_CHECK(heap.get_locked_size() == 0);
 
@@ -84,11 +88,11 @@ BOOST_AUTO_TEST_CASE(allocator_locked_test)
     BOOST_CHECK(heap.get_locked_size() == 0);
 }
 
-BOOST_AUTO_TEST_CASE(vector_test)
+BOOST_AUTO_TEST_CASE_TEMPLATE(vector_test, Assertion, assertion_types)
 {
     const size_t size = 1 << 10;
-    securememory::win32::heap heap(size);
-    securememory::allocator< char > allocator(&heap);
+    securememory::win32::basic_heap< Assertion > heap(size);
+    securememory::allocator< char, decltype(heap) > allocator(&heap);
 
     std::vector< char, decltype(allocator) > vec(allocator);
     vec.reserve(size / 2);
@@ -122,18 +126,20 @@ BOOST_AUTO_TEST_CASE(map_test_global)
     vec.emplace_back("bbb");
 }
 
-BOOST_AUTO_TEST_CASE(parallel_test)
+BOOST_AUTO_TEST_CASE_TEMPLATE(parallel_test, Assertion, assertion_types)
 {
     const int count = 100000;
     const auto workers = std::thread::hardware_concurrency();
 
-    securememory::win32::heap heap(1 << 30);
+    securememory::win32::basic_heap< Assertion > heap(1 << 30);
 
     std::vector< std::thread > threads;
     for (size_t i = 0; i < workers; ++i)
     {
-        threads.emplace_back([count, &heap]() {
-            std::set< int, std::less< int >, securememory::allocator< int > > set(&heap);
+        threads.emplace_back([count, &heap]()
+        {
+            securememory::allocator< int, securememory::win32::basic_heap< Assertion > > allocator(&heap);
+            std::set< int, std::less< int >, decltype(allocator) > set(allocator);
 
             for (int i = 0; i < count; ++i)
             {

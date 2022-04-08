@@ -11,25 +11,52 @@
 #include <stdexcept>
 #include <mutex>
 
-// #define HEAP_VERIFY
-
-#if !defined(HEAP_VERIFY)
-#if defined(_DEBUG)
-#define HEAP_VERIFY
-#endif
-#endif
-
-#if defined(HEAP_VERIFY)
-#define HEAP_ABORT(message) do { std::cerr << __FILE__ << ":" << __LINE__ << ": " << (message) << std::endl; std::abort(); } while(0)
-#define HEAP_ASSERT(...) do { if(!(__VA_ARGS__)) { HEAP_ABORT(#__VA_ARGS__); } } while(0)
 #include <psapi.h>
-#else
-#define HEAP_ASSERT(...) do {} while(0)
-#endif
 
 namespace securememory::win32
 {
-    class heap
+    template < bool > struct assertions;
+
+    template <> struct assertions< true >
+    {
+        static constexpr bool enabled = true;
+
+        static void abort(const char* file, uint32_t line, const char* message)
+        {
+            std::cerr << file << ":" << line << ": " << message << std::endl;
+            std::abort();
+        }
+    };
+
+    template <> struct assertions< false >
+    {
+        static constexpr bool enabled = false;
+    };
+
+    #if !defined(HEAP_ASSERTIONS)
+    #if defined(_DEBUG)
+    #define HEAP_ASSERTIONS assertions< true >
+    #else
+    #define HEAP_ASSERTIONS assertions< false >
+    #endif
+    #endif
+
+    template < typename Assertions > class basic_heap;
+    using heap = basic_heap< HEAP_ASSERTIONS >;
+    #undef HEAP_ASSERTIONS
+
+    #if !defined(HEAP_ASSERT)
+    #define HEAP_ASSERT(...) \
+        do { \
+            if constexpr (Assertions::enabled) \
+            { \
+                if(!(__VA_ARGS__)) Assertions::abort(__FILE__, __LINE__, (#__VA_ARGS__)); \
+            } \
+        } while(0)
+    #endif
+
+    template < typename Assertions > class basic_heap
+        : public Assertions
     {
         class exception : public std::exception
         {
@@ -63,7 +90,7 @@ namespace securememory::win32
     public:
         static constexpr std::size_t alignment = MEMORY_ALLOCATION_ALIGNMENT;
 
-        heap(std::size_t reserve)
+        basic_heap(std::size_t reserve)
             : allocated_()
         {
             if (reserve == 0)
@@ -99,7 +126,7 @@ namespace securememory::win32
             heap_.reset(handle);
         }
 
-        ~heap()
+        ~basic_heap()
         {
             HEAP_ASSERT(heap_ != NULL);
 
@@ -462,13 +489,12 @@ namespace securememory::win32
             return { base, size };
         }
 
-    #if defined(HEAP_VERIFY)
         // Check that pages have proper refcounts
         bool verify_refcount(uintptr_t address, bool zero)
         {
             uintptr_t base = get_base_address();
 
-            // Check proper refcount on first page
+            // Check proper refcount on the first page
             uintptr_t index = (address - base) >> get_page_size_log();
             auto refcount = heap_pages_[index].refs.load(std::memory_order_relaxed);
             HEAP_ASSERT(zero ? refcount == 0 : refcount > 0);
@@ -477,7 +503,7 @@ namespace securememory::win32
 
         bool verify_refcounts(uintptr_t address, std::size_t pages, bool zero)
         {
-            // Check proper refcount on first page
+            // Check proper refcount on the first page
             HEAP_ASSERT(verify_refcount(address, zero));
             if (pages > 1)
             {
@@ -510,7 +536,6 @@ namespace securememory::win32
 
             return true;
         }
-    #endif
 
         std::unique_ptr< HANDLE, heap_deleter > heap_;
 
@@ -555,4 +580,6 @@ namespace securememory::win32
         std::size_t size_;
         std::atomic< std::size_t > allocated_;
     };
+
+    #undef HEAP_ASSERT
 }

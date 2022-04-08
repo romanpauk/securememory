@@ -15,7 +15,7 @@
 
 namespace securememory
 {
-    template <class T, class Heap = win32::heap >
+    template < typename T, typename Heap = win32::heap >
     class allocator
     {
         template <class U, class Heap > friend class allocator;
