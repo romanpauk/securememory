@@ -165,6 +165,13 @@ BOOST_AUTO_TEST_CASE_TEMPLATE(parallel_test, Assertion, assertion_types)
     }
 }
 
+BOOST_AUTO_TEST_CASE(pagetable_allocator)
+{
+    securememory::win32::page_allocator< int[256] > allocator;
+    auto *p = allocator.allocate(1);
+    allocator.deallocate(p, 1);
+}
+
 BOOST_AUTO_TEST_CASE(pagetable_test)
 {
     struct page_data
