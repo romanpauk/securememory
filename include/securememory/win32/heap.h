@@ -7,45 +7,107 @@
 
 #pragma once
 
-#include <cassert>
-#include <stdexcept>
 #include <mutex>
-
-// #define HEAP_VERIFY
-
-#if !defined(HEAP_VERIFY)
-#if defined(_DEBUG)
-#define HEAP_VERIFY
-#endif
-#endif
-
-#if defined(HEAP_VERIFY)
-#define HEAP_ABORT(message) do { std::cerr << __FILE__ << ":" << __LINE__ << ": " << (message) << std::endl; std::abort(); } while(0)
-#define HEAP_ASSERT(...) do { if(!(__VA_ARGS__)) { HEAP_ABORT(#__VA_ARGS__); } } while(0)
 #include <psapi.h>
-#else
-#define HEAP_ASSERT(...) do {} while(0)
-#endif
+
+#include <securememory/win32/exception.h>
 
 namespace securememory::win32
 {
-    class heap
+    #if !defined(HEAP_ASSERT)
+    #define HEAP_ASSERT(...) \
+            do { \
+                if constexpr (enabled) \
+                { \
+                    if(!(__VA_ARGS__)) abort(__FILE__, __LINE__, (#__VA_ARGS__)); \
+                } \
+            } while(0)
+    #endif
+
+    template < bool > class assertions;
+
+    #if !defined(HEAP_ASSERTIONS)
+    #if defined(_DEBUG)
+    #define HEAP_ASSERTIONS assertions< true >
+    #else
+    #define HEAP_ASSERTIONS assertions< false >
+    #endif
+    #endif
+
+    template <> class assertions< false >
     {
-        class exception : public std::exception
+    public:
+        static constexpr bool enabled = false;
+    };
+
+    template <> class assertions< true >
+    {
+    public:
+        static constexpr bool enabled = true;
+
+        static void abort(const char* file, uint32_t line, const char* message)
         {
-        public:
-            exception(const char* function, DWORD last_error = GetLastError())
-                : last_error_(last_error)
-                , function_(function)
-            {}
+            std::cerr << file << ":" << line << ": " << message << std::endl;
+            std::abort();
+        }
 
-            const char* what() const override { return function_; }
-            DWORD get_last_error() const { return last_error_; }
+        // Check that pages have proper refcounts
+        template < typename Heap > bool verify_refcount(Heap* heap, uintptr_t address, bool zero)
+        {
+            uintptr_t base = heap->get_base_address();
 
-        private:
-            DWORD last_error_;
-            const char* function_;
-        };
+            // Check proper refcount on the first page
+            uintptr_t index = (address - base) >> heap->get_page_size_log();
+            auto refcount = heap->heap_pages_[index].refs.load(std::memory_order_relaxed);
+            HEAP_ASSERT(zero ? refcount == 0 : refcount > 0);
+            return true;
+        }
+
+        template < typename Heap > bool verify_refcounts(Heap* heap, uintptr_t address, std::size_t pages, bool zero)
+        {
+            // Check proper refcount on the first page
+            HEAP_ASSERT(verify_refcount(heap, address, zero));
+            if (pages > 1)
+            {
+                HEAP_ASSERT(verify_refcount(heap, address + ((pages - 1) << heap->get_page_size_log()), zero));
+            }
+
+            return true;
+        }
+
+        // Check that pages are locked in the memory
+        template < typename Heap > bool verify_locked(Heap* heap, uintptr_t address, std::size_t pages, bool locked)
+        {
+            std::vector< PSAPI_WORKING_SET_EX_INFORMATION > wset(pages);
+            ZeroMemory(&wset[0], wset.size());
+            for (std::size_t i = 0; i < pages; ++i)
+            {
+                wset[i].VirtualAddress = reinterpret_cast<PVOID>(address + (i << heap->get_page_size_log()));
+            }
+
+            if (QueryWorkingSetEx(GetCurrentProcess(), &wset[0], static_cast<DWORD>(sizeof(wset[0]) * wset.size())) == FALSE)
+            {
+                throw exception("QueryWorkingSetEx");
+            }
+
+            for (std::size_t i = 0; i < pages; ++i)
+            {
+                HEAP_ASSERT(wset[i].VirtualAttributes.Valid == TRUE);
+                HEAP_ASSERT(wset[i].VirtualAttributes.Locked == locked);
+            }
+
+            return true;
+        }
+    };
+
+    template < typename Assertions > class basic_heap;
+    using heap = basic_heap< HEAP_ASSERTIONS >;
+    #undef HEAP_ASSERTIONS
+
+    template < typename Assertions > class basic_heap
+        : public Assertions
+    {
+        friend class assertions< true >;
 
         struct heap_deleter
         {
@@ -63,7 +125,7 @@ namespace securememory::win32
     public:
         static constexpr std::size_t alignment = MEMORY_ALLOCATION_ALIGNMENT;
 
-        heap(std::size_t reserve)
+        basic_heap(std::size_t reserve)
             : allocated_()
         {
             if (reserve == 0)
@@ -99,7 +161,7 @@ namespace securememory::win32
             heap_.reset(handle);
         }
 
-        ~heap()
+        ~basic_heap()
         {
             HEAP_ASSERT(heap_ != NULL);
 
@@ -362,8 +424,8 @@ namespace securememory::win32
                 }
             }
 
-            HEAP_ASSERT(verify_refcounts(first, pages, false));
-            HEAP_ASSERT(verify_locked(first, pages, true));
+            HEAP_ASSERT(verify_refcounts(this, first, pages, false));
+            HEAP_ASSERT(verify_locked(this, first, pages, true));
             return true;
         }
 
@@ -373,8 +435,8 @@ namespace securememory::win32
             const auto pages = get_pages(size);
             const uintptr_t last = first + ((pages - 1) << get_page_size_log());
 
-            HEAP_ASSERT(verify_refcounts(first, pages, false));
-            HEAP_ASSERT(verify_locked(first, pages, true));
+            HEAP_ASSERT(verify_refcounts(this, first, pages, false));
+            HEAP_ASSERT(verify_locked(this, first, pages, true));
 
             bool lock[2] = {};
             // Get first page
@@ -462,56 +524,6 @@ namespace securememory::win32
             return { base, size };
         }
 
-    #if defined(HEAP_VERIFY)
-        // Check that pages have proper refcounts
-        bool verify_refcount(uintptr_t address, bool zero)
-        {
-            uintptr_t base = get_base_address();
-
-            // Check proper refcount on first page
-            uintptr_t index = (address - base) >> get_page_size_log();
-            auto refcount = heap_pages_[index].refs.load(std::memory_order_relaxed);
-            HEAP_ASSERT(zero ? refcount == 0 : refcount > 0);
-            return true;
-        }
-
-        bool verify_refcounts(uintptr_t address, std::size_t pages, bool zero)
-        {
-            // Check proper refcount on first page
-            HEAP_ASSERT(verify_refcount(address, zero));
-            if (pages > 1)
-            {
-                HEAP_ASSERT(verify_refcount(address + ((pages - 1) << get_page_size_log()), zero));
-            }
-
-            return true;
-        }
-
-        // Check that pages are locked in the memory
-        bool verify_locked(uintptr_t address, std::size_t pages, bool locked)
-        {
-            std::vector< PSAPI_WORKING_SET_EX_INFORMATION > wset(pages);
-            ZeroMemory(&wset[0], wset.size());
-            for (std::size_t i = 0; i < pages; ++i)
-            {
-                wset[i].VirtualAddress = reinterpret_cast<PVOID>(address + (i << get_page_size_log()));
-            }
-
-            if (QueryWorkingSetEx(GetCurrentProcess(), &wset[0], static_cast<DWORD>(sizeof(wset[0]) * wset.size())) == FALSE)
-            {
-                throw exception("QueryWorkingSetEx");
-            }
-
-            for (std::size_t i = 0; i < pages; ++i)
-            {
-                HEAP_ASSERT(wset[i].VirtualAttributes.Valid == TRUE);
-                HEAP_ASSERT(wset[i].VirtualAttributes.Locked == locked);
-            }
-
-            return true;
-        }
-    #endif
-
         std::unique_ptr< HANDLE, heap_deleter > heap_;
 
         // From "Scalable Reader-Writer Synchronization for Shared-Memory Multiprocessors"
@@ -555,4 +567,6 @@ namespace securememory::win32
         std::size_t size_;
         std::atomic< std::size_t > allocated_;
     };
+
+    #undef HEAP_ASSERT
 }
