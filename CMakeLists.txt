@@ -15,6 +15,7 @@ target_include_directories(securememory INTERFACE include)
 target_sources(securememory INTERFACE
     include/securememory/win32/exception.h
     include/securememory/win32/heap.h
+    include/securememory/win32/page_table.h
     include/securememory/allocator.h
     readme.md
 )

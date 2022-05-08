@@ -9,6 +9,7 @@
 #include <boost/mpl/list.hpp>
 
 #include <securememory/allocator.h>
+#include <securememory/win32/page_table.h>
 
 #include <set>
 #include <thread>
@@ -128,7 +129,12 @@ BOOST_AUTO_TEST_CASE(map_test_global)
 
 BOOST_AUTO_TEST_CASE_TEMPLATE(parallel_test, Assertion, assertion_types)
 {
+#if defined(_DEBUG)
+    const int count = 1000;
+#else
     const int count = 100000;
+#endif
+
     const auto workers = std::thread::hardware_concurrency();
 
     securememory::win32::basic_heap< Assertion > heap(1 << 30);
@@ -157,4 +163,16 @@ BOOST_AUTO_TEST_CASE_TEMPLATE(parallel_test, Assertion, assertion_types)
     {
         threads[i].join();
     }
+}
+
+BOOST_AUTO_TEST_CASE(pagetable_test)
+{
+    struct page_data
+    {
+        std::atomic< uint16_t > refs;
+        std::atomic< uint16_t > lock;
+    };
+
+    securememory::win32::page_table< page_data > pt;
+    auto& data = pt[uintptr_t(&pt)];
 }
